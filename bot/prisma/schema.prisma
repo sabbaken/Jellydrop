@@ -1,0 +1,40 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  runtime             = "nodejs"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+// The connection URL lives in prisma.config.ts (CLI) and in the driver
+// adapter passed to PrismaClient (runtime) — Prisma 7 forbids it here.
+datasource db {
+  provider = "sqlite"
+}
+
+// One row per download job (spec §4). Status/mode are plain strings because
+// Prisma does not support enums on SQLite; the typed unions live in db.ts.
+model Job {
+  id            Int       @id @default(autoincrement())
+  url           String
+  mode          String    @default("video") // 'video' | 'audio'
+  status        String    @default("queued") // state machine, spec §6
+  source        String? // extractor_key, e.g. 'Youtube'
+  title         String? // known after probe
+  progress      Float     @default(0) // 0..100
+  speed         String? // transient, for the status message
+  eta           String? // transient, for the status message
+  stagingPath   String?   @map("staging_path")
+  finalPath     String?   @map("final_path")
+  error         String?
+  batchId       String    @map("batch_id") // groups links from one message
+  tgChatId      BigInt    @map("tg_chat_id") // Telegram ids exceed int32
+  tgStatusMsgId BigInt?   @map("tg_status_msg_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  startedAt     DateTime? @map("started_at")
+  finishedAt    DateTime? @map("finished_at")
+
+  @@index([status])
+  @@index([batchId])
+  @@map("jobs")
+}

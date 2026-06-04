@@ -51,3 +51,7 @@ tmp
 
 # Runtime data (sqlite, cookies) — mounted into the bot container
 /data/
+
+# Prisma (generated client is rebuilt by `pnpm build`; dev.db is scratch)
+bot/src/generated/
+bot/prisma/dev.db
