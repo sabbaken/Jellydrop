@@ -48,3 +48,6 @@ tmp
 .env
 .env.local
 .env.*.local
+
+# Runtime data (sqlite, cookies) — mounted into the bot container
+/data/

@@ -1,13 +1,12 @@
 {
-  "name": "untitled",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "jellydrop",
+  "version": "0.1.0",
+  "description": "Telegram -> yt-dlp -> Jellyfin home-server bot",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "pnpm -C bot build",
+    "typecheck": "pnpm -C bot typecheck",
+    "dev": "pnpm -C bot dev"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "packageManager": "pnpm@10.11.0"
 }

@@ -1,0 +1,30 @@
+services:
+  bot:
+    build: ./bot
+    env_file: .env
+    volumes:
+      - ./data:/data            # sqlite + cookies (optional), lives outside the image
+      - media:/media            # rw: /media/staging and /media/library
+    depends_on:
+      - jellyfin
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  jellyfin:
+    image: jellyfin/jellyfin
+    volumes:
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+      - media:/media:ro         # Jellyfin library points at /media/library
+    ports:
+      - "8096:8096"
+    restart: unless-stopped
+
+volumes:
+  media:
+  jellyfin-config:
+  jellyfin-cache:
