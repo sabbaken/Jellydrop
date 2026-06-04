@@ -1,0 +1,12 @@
+# Dev override: Jellyfin in Docker, the bot on the host (pnpm dev).
+# The bot writes into ./data/media on the host; Jellyfin sees it read-only.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d jellyfin
+#
+# Point the Jellyfin library at /media/library (Dashboard -> Libraries).
+services:
+  jellyfin:
+    volumes:
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+      - ./data/media:/media:ro
