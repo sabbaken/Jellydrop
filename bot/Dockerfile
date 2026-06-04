@@ -1,7 +1,8 @@
 FROM node:22-bookworm-slim
 
+# openssl: used by the Prisma CLI's schema engine (migrate deploy at startup)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg ca-certificates curl python3 \
+      ffmpeg ca-certificates curl python3 openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp as a standalone binary (easy to update via `yt-dlp -U`).
@@ -23,8 +24,13 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
-COPY tsconfig.json ./
+COPY tsconfig.json prisma.config.ts ./
+COPY prisma ./prisma
 COPY src ./src
+# build = prisma generate + tsc; prune drops dev deps but keeps the prisma CLI
 RUN pnpm build && pnpm prune --prod
 
-CMD ["node", "dist/index.js"]
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+
+ENTRYPOINT ["./entrypoint.sh"]

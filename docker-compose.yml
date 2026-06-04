@@ -2,6 +2,7 @@ services:
   bot:
     build: ./bot
     env_file: .env
+    init: true                  # reap yt-dlp/ffmpeg children properly
     volumes:
       - ./data:/data            # sqlite + cookies (optional), lives outside the image
       - media:/media            # rw: /media/staging and /media/library
