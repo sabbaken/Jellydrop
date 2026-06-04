@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Config } from "./config.js";
-import { ACTIVE_STATUSES, type Job, type JobPatch, type JobStore } from "./db.js";
+import {
+  ACTIVE_STATUSES,
+  MAX_DOWNLOAD_ATTEMPTS,
+  type Job,
+  type JobPatch,
+  type JobStore,
+} from "./db.js";
 import {
   CanceledError,
   DownloadError,
@@ -31,6 +37,13 @@ function log(message: string): void {
   console.log(`${new Date().toISOString()} [queue] ${message}`);
 }
 
+/** Backoff before retry attempt 2, 3, 4, 5 (spec: transient failures only). */
+const RETRY_DELAYS_MS = [10, 30, 60, 120].map((m) => m * 60_000);
+
+function retryDelayMs(failedAttempts: number): number {
+  return RETRY_DELAYS_MS[Math.min(failedAttempts - 1, RETRY_DELAYS_MS.length - 1)]!;
+}
+
 /**
  * In-process worker pool (spec §5). The DB is the source of truth: workers
  * atomically claim `queued` jobs, at most `downloadConcurrency` run at once.
@@ -40,6 +53,7 @@ export class DownloadQueue {
   private draining = false;
   private wakeRequested = false;
   private stopped = false;
+  private retryTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly store: JobStore,
@@ -80,12 +94,34 @@ export class DownloadQueue {
           });
       }
     }
+    await this.scheduleRetryWake();
+  }
+
+  /** Arm a timer for the earliest queued-with-backoff job (if any). */
+  private async scheduleRetryWake(): Promise<void> {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (this.stopped) return;
+    const next = await this.store.nextRetryAt();
+    if (!next) return;
+    const delayMs = Math.max(1000, next.getTime() - Date.now());
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.notify();
+    }, delayMs);
+    this.retryTimer.unref();
   }
 
   /** Graceful shutdown: stop claiming, SIGTERM live yt-dlp processes. Jobs stay
    * in `downloading` and are re-queued by startup recovery (spec §5). */
   shutdown(): void {
     this.stopped = true;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     killAllProcesses();
   }
 
@@ -290,8 +326,33 @@ export class DownloadQueue {
           ? err.message
           : `internal error: ${err instanceof Error ? err.message : String(err)}`;
 
+    // Transient failure (rate limit, network, 5xx): back to the queue with a
+    // growing backoff. Partial files stay — yt-dlp --continue resumes them.
+    const attempts = (current?.attempts ?? 0) + 1;
+    if (err instanceof DownloadError && err.retryable && attempts < MAX_DOWNLOAD_ATTEMPTS) {
+      const delayMs = retryDelayMs(attempts);
+      const requeued = await this.store.transition(jobId, ACTIVE_STATUSES, "queued", {
+        error: message.slice(0, 1000),
+        attempts,
+        retryAt: new Date(Date.now() + delayMs),
+        speed: null,
+        eta: null,
+      });
+      if (requeued) {
+        this.hooks.onJobUpdate(requeued, { force: true });
+        await this.scheduleRetryWake();
+        log(
+          `job ${jobId}: transient failure (attempt ${attempts}/${MAX_DOWNLOAD_ATTEMPTS}), ` +
+            `retry in ${Math.round(delayMs / 60_000)}m — ${message}`,
+        );
+        return;
+      }
+      // Guard failed (canceled meanwhile) — fall through to the failed path.
+    }
+
     const updated = await this.store.transition(jobId, ACTIVE_STATUSES, "failed", {
       error: message.slice(0, 1000),
+      attempts,
       speed: null,
       eta: null,
       finishedAt: new Date(),
@@ -314,6 +375,8 @@ export class DownloadQueue {
         finishedAt: new Date(),
       });
       if (updated) {
+        // A retry-waiting job may have partial files from earlier attempts.
+        fs.rmSync(this.jobDir(jobId), { recursive: true, force: true });
         this.hooks.onJobUpdate(updated, { force: true });
         log(`job ${jobId}: canceled while queued`);
         return "canceled";

@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { CANCELABLE_STATUSES, type Job, type JobStatus } from "../db.js";
+import { CANCELABLE_STATUSES, MAX_DOWNLOAD_ATTEMPTS, type Job, type JobStatus } from "../db.js";
 import { escapeHtml, progressBar, truncate } from "../util/format.js";
 
 const STATUS_LABEL: Record<JobStatus, string> = {
@@ -20,9 +20,19 @@ function headerLine(job: Job): string {
   return job.source ? `${escapeHtml(job.source)} · ${name}` : name;
 }
 
+/** Job is queued waiting out a retry backoff (transient failure earlier). */
+function isRetryWaiting(job: Job): boolean {
+  return job.status === "queued" && job.retryAt !== null && job.retryAt.getTime() > Date.now();
+}
+
+function retryLabel(job: Job): string {
+  const minutes = Math.max(1, Math.round((job.retryAt!.getTime() - Date.now()) / 60_000));
+  return `⏳ повтор через ~${minutes} мин (попытка ${job.attempts + 1}/${MAX_DOWNLOAD_ATTEMPTS})`;
+}
+
 /** `⬇️ скачивание  [▓▓▓▓░░░░ 52%]  3.1MB/s  ETA 00:41` (spec §10.3). */
 function statusLine(job: Job): string {
-  const parts: string[] = [STATUS_LABEL[job.status]];
+  const parts: string[] = [isRetryWaiting(job) ? retryLabel(job) : STATUS_LABEL[job.status]];
 
   if (job.status === "downloading") {
     parts.push(`[${progressBar(job.progress)} ${Math.floor(job.progress)}%]`);
@@ -43,6 +53,9 @@ export function renderJobMessage(job: Job, deepLink?: string | null): string {
 
   if (job.status === "failed" && job.error) {
     lines.push(`<i>${escapeHtml(truncate(job.error, 400))}</i>`);
+  }
+  if (isRetryWaiting(job) && job.error) {
+    lines.push(`<i>${escapeHtml(truncate(job.error, 200))}</i>`);
   }
   if (job.status === "done") {
     const title = escapeHtml(truncate(job.title ?? job.url, 120));
@@ -68,7 +81,7 @@ export function renderQueueList(jobs: Job[]): string {
 
   const lines = jobs.map((job) => {
     const title = escapeHtml(truncate(job.title ?? job.url, 60));
-    const status = STATUS_LABEL[job.status];
+    const status = isRetryWaiting(job) ? retryLabel(job) : STATUS_LABEL[job.status];
     const percent =
       job.status === "downloading" ? ` ${Math.floor(job.progress)}%` : "";
     return `#${job.id} · ${title}\n    ${status}${percent}`;

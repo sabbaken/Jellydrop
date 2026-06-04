@@ -34,6 +34,8 @@ export interface Job {
   stagingPath: string | null;
   finalPath: string | null;
   error: string | null;
+  attempts: number;
+  retryAt: Date | null;
   batchId: string;
   tgChatId: number;
   tgStatusMsgId: number | null;
@@ -56,6 +58,9 @@ export const CANCELABLE_STATUSES: readonly JobStatus[] = [
   "processing",
 ];
 
+/** Total tries per job: the first one + up to 4 backoff retries. */
+export const MAX_DOWNLOAD_ATTEMPTS = 5;
+
 export interface JobPatch {
   status?: JobStatus;
   source?: string | null;
@@ -66,6 +71,8 @@ export interface JobPatch {
   stagingPath?: string | null;
   finalPath?: string | null;
   error?: string | null;
+  attempts?: number;
+  retryAt?: Date | null;
   tgStatusMsgId?: number | null;
   startedAt?: Date | null;
   finishedAt?: Date | null;
@@ -159,14 +166,19 @@ export class JobStore {
   }
 
   /**
-   * Atomically claim the oldest queued job: queued -> downloading. The
-   * status guard on the update means two claimants can never win the same
-   * job — the loser just retries with the next candidate.
+   * Atomically claim the oldest claimable queued job: queued -> downloading.
+   * Jobs waiting out a retry backoff (retryAt in the future) are skipped.
+   * The status guard on the update means two claimants can never win the
+   * same job — the loser just retries with the next candidate.
    */
   async claimNextQueued(): Promise<Job | undefined> {
     for (;;) {
+      const now = new Date();
       const candidate = await this.prisma.job.findFirst({
-        where: { status: "queued" },
+        where: {
+          status: "queued",
+          OR: [{ retryAt: null }, { retryAt: { lte: now } }],
+        },
         orderBy: { id: "asc" },
         select: { id: true },
       });
@@ -174,11 +186,21 @@ export class JobStore {
 
       const { count } = await this.prisma.job.updateMany({
         where: { id: candidate.id, status: "queued" },
-        data: { status: "downloading", startedAt: new Date(), error: null },
+        data: { status: "downloading", startedAt: now, error: null, retryAt: null },
       });
       if (count === 1) return this.getJob(candidate.id);
       // Lost the race (canceled or claimed from under us) — try the next one.
     }
+  }
+
+  /** Earliest future retry among queued jobs — drives the queue wake-up timer. */
+  async nextRetryAt(): Promise<Date | undefined> {
+    const row = await this.prisma.job.findFirst({
+      where: { status: "queued", retryAt: { gt: new Date() } },
+      orderBy: { retryAt: "asc" },
+      select: { retryAt: true },
+    });
+    return row?.retryAt ?? undefined;
   }
 
   /**

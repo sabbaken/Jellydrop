@@ -27,6 +27,8 @@ model Job {
   stagingPath   String?   @map("staging_path")
   finalPath     String?   @map("final_path")
   error         String?
+  attempts      Int       @default(0) // failed download attempts so far
+  retryAt       DateTime? @map("retry_at") // queued-with-backoff: not claimable before this
   batchId       String    @map("batch_id") // groups links from one message
   tgChatId      BigInt    @map("tg_chat_id") // Telegram ids exceed int32
   tgStatusMsgId BigInt?   @map("tg_status_msg_id")

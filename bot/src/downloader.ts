@@ -17,7 +17,27 @@ const MEDIA_EXTENSIONS = new Set([
   ".opus", ".m4a", ".mp3", ".flac", ".ogg", ".oga", ".wav", ".aac",
 ]);
 
-export class DownloadError extends Error {}
+export class DownloadError extends Error {
+  /** Transient failure (rate limit, network, 5xx) — worth retrying later. */
+  constructor(
+    message: string,
+    readonly retryable = false,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Transient yt-dlp failures: the service throttled us (the classic
+ * "stops serving after N videos"), a network hiccup, or a server error.
+ * Anything else (private/removed video, unsupported URL) is permanent.
+ */
+const RETRYABLE_STDERR_RE =
+  /HTTP Error (?:429|5\d\d)|Too Many Requests|rate.?limit|timed? ?out|timeout|connection (?:reset|refused|aborted)|temporary failure|getaddrinfo|network is unreachable|unable to connect|sign in to confirm|incomplete read|read error/i;
+
+export function isRetryableStderr(lines: string[]): boolean {
+  return RETRYABLE_STDERR_RE.test(lines.join("\n"));
+}
 export class PlaylistError extends Error {
   constructor() {
     super("playlist");
@@ -90,7 +110,9 @@ export function killAllProcesses(): void {
 }
 
 function commonArgs(config: Config): string[] {
-  const args: string[] = [];
+  // A small pause between the extractor's internal requests makes tripping
+  // service rate limits noticeably less likely (costs a few seconds per job).
+  const args: string[] = ["--sleep-requests", "0.75"];
   if (config.cookiesFile && fs.existsSync(config.cookiesFile)) {
     args.push("--cookies", config.cookiesFile);
   }
@@ -151,13 +173,13 @@ export function probe(jobId: number, url: string, config: Config): Promise<Probe
     child.once("close", (code, signal) => {
       clearTimeout(timeout);
       if (timedOut) {
-        return reject(new DownloadError("probe timed out"));
+        return reject(new DownloadError("probe timed out", true));
       }
       if (signal) {
         return reject(new CanceledError());
       }
       if (code !== 0) {
-        return reject(new DownloadError(summarizeStderr(stderr)));
+        return reject(new DownloadError(summarizeStderr(stderr), isRetryableStderr(stderr)));
       }
       try {
         const raw = JSON.parse(stdout) as Record<string, unknown>;
@@ -221,6 +243,9 @@ function downloadArgs(mode: JobMode, jobDir: string, config: Config): string[] {
     // mtime must be the download time, not the remote upload date — the
     // optional auto-cleanup sweeps by mtime (cleanup.ts).
     "--no-mtime",
+    // gentle pacing between fragment/format downloads (anti rate-limit)
+    "--sleep-interval", "2",
+    "--max-sleep-interval", "5",
     "--newline",
     "--progress-template", PROGRESS_TEMPLATE,
     "-o", output,
@@ -278,7 +303,8 @@ export function download(
 
     child.once("close", (code, signal) => {
       if (signal) return reject(new CanceledError());
-      if (code !== 0) return reject(new DownloadError(summarizeStderr(stderr)));
+      if (code !== 0)
+        return reject(new DownloadError(summarizeStderr(stderr), isRetryableStderr(stderr)));
       if (sawMaxFilesizeSkip && !findOutputFiles(jobDir).media) {
         return reject(
           new DownloadError(`file exceeds the MAX_FILESIZE limit (${config.maxFilesize})`),
