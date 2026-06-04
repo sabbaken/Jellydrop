@@ -1,22 +1,19 @@
 import { Bot } from "grammy";
 import type { Config } from "../config.js";
-import { registerCallbacks } from "./callbacks.js";
-import { registerHandlers, type BotDeps } from "./handlers.js";
 
 /**
- * grammY bot with the auth middleware first in the chain (spec §10.1):
+ * Bare grammY bot with the auth middleware first in the chain (spec §10.1):
  * updates from anyone but ALLOWED_TELEGRAM_USER_ID are silently dropped.
+ * Handlers/callbacks are registered by the bootstrap once the queue exists
+ * (the StatusMessenger needs `bot.api` before the queue can be built).
  */
-export function createBot(config: Config, deps: BotDeps): Bot {
+export function createBot(config: Config): Bot {
   const bot = new Bot(config.telegramBotToken);
 
   bot.use(async (ctx, next) => {
     if (ctx.from?.id !== config.allowedTelegramUserId) return;
     await next();
   });
-
-  registerHandlers(bot, deps);
-  registerCallbacks(bot, deps);
 
   bot.catch((err) => {
     console.error(`${new Date().toISOString()} [telegram] handler error: ${String(err.error)}`);
