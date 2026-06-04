@@ -1,5 +1,8 @@
 services:
   bot:
+    # built by CI (.github/workflows/bot-image.yml); `docker compose build`
+    # still works locally and tags the result with the same name
+    image: ghcr.io/sabbaken/jellydrop-bot:latest
     build: ./bot
     env_file: .env
     init: true                  # reap yt-dlp/ffmpeg children properly
