@@ -218,6 +218,9 @@ function downloadArgs(mode: JobMode, jobDir: string, config: Config): string[] {
     "--restrict-filenames",
     "--no-playlist",
     "--continue",
+    // mtime must be the download time, not the remote upload date — the
+    // optional auto-cleanup sweeps by mtime (cleanup.ts).
+    "--no-mtime",
     "--newline",
     "--progress-template", PROGRESS_TEMPLATE,
     "-o", output,

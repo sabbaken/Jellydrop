@@ -39,6 +39,14 @@ async function main(): Promise<void> {
   registerHandlers(bot, deps);
   registerCallbacks(bot, deps);
 
+  // jobs that recovery flipped straight to done: their status messages are
+  // stuck on an intermediate state — push one final edit (spec §5: keep
+  // editing the same tg_status_msg_id after restart)
+  for (const id of recovery.completedJobIds) {
+    const job = await store.getJob(id);
+    if (job) messenger.onJobUpdate(job, { force: true });
+  }
+
   // a job was interrupted after its file reached the library — re-trigger the
   // refresh that never happened (spec §14)
   if (recovery.needsLibraryRefresh) {

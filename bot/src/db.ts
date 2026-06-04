@@ -74,6 +74,8 @@ export interface JobPatch {
 export interface RecoveryReport {
   requeued: number;
   completed: number;
+  /** Jobs flipped to done by recovery — their status messages need a final edit. */
+  completedJobIds: number[];
   /** True when a job was interrupted in moving/scanning — the library may need a refresh. */
   needsLibraryRefresh: boolean;
 }
@@ -222,7 +224,12 @@ export class JobStore {
    * - scanning -> done (the file is in the library; refresh is re-triggered)
    */
   async recoverStaleJobs(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { requeued: 0, completed: 0, needsLibraryRefresh: false };
+    const report: RecoveryReport = {
+      requeued: 0,
+      completed: 0,
+      completedJobIds: [],
+      needsLibraryRefresh: false,
+    };
 
     await this.prisma.$transaction(async (tx) => {
       const stale = await tx.job.findMany({
@@ -246,6 +253,7 @@ export class JobStore {
             },
           });
           report.completed += 1;
+          report.completedJobIds.push(job.id);
           report.needsLibraryRefresh = true;
         } else {
           await tx.job.update({

@@ -234,9 +234,22 @@ export class DownloadQueue {
       job.mode === "audio" ? path.join(this.config.libraryDir, "audio") : this.config.libraryDir;
     fs.mkdirSync(destDir, { recursive: true });
 
+    // Never overwrite an existing library file (same URL re-sent after done,
+    // or a title+id collision) — disambiguate the whole basename stem so the
+    // media file and its sidecars (.nfo, thumbnail, subs) stay paired.
+    const ext = path.extname(media);
+    const stem = path.basename(media, ext);
+    let suffix = "";
+    if (fs.existsSync(path.join(destDir, path.basename(media)))) {
+      suffix = ` (job ${job.id})`;
+      log(`job ${job.id}: "${stem}${ext}" already in library, saving as "${stem}${suffix}${ext}"`);
+    }
+    const destName = (name: string): string =>
+      suffix && name.startsWith(stem) ? stem + suffix + name.slice(stem.length) : name;
+
     let finalMediaPath = "";
     for (const src of toMove) {
-      const dest = path.join(destDir, path.basename(src));
+      const dest = path.join(destDir, destName(path.basename(src)));
       moveFile(src, dest);
       if (src === media) finalMediaPath = dest;
     }

@@ -18,8 +18,12 @@ interface MessageState {
   backoffUntil: number;
   /** Last text+keyboard signature actually sent — skip no-op edits. */
   lastSignature: string | null;
+  /** Consecutive transient-error retries; reset on a successful edit. */
+  retries: number;
   timer: NodeJS.Timeout | null;
 }
+
+const MAX_TRANSIENT_RETRIES = 8;
 
 function log(message: string): void {
   console.log(`${new Date().toISOString()} [telegram] ${message}`);
@@ -53,6 +57,7 @@ export class StatusMessenger implements QueueHooks {
         lastEditAt: 0,
         backoffUntil: 0,
         lastSignature: null,
+        retries: 0,
         timer: null,
       };
       this.states.set(job.id, state);
@@ -135,11 +140,14 @@ export class StatusMessenger implements QueueHooks {
     try {
       await this.api.editMessageText(job.tgChatId, job.tgStatusMsgId!, text, {
         parse_mode: "HTML",
-        reply_markup: keyboard,
+        // Explicit empty keyboard when the job is no longer cancelable — never
+        // rely on the API's omitted-field behavior to drop the button.
+        reply_markup: keyboard ?? { inline_keyboard: [] },
         link_preview_options: { is_disabled: true },
       });
       state.lastSignature = signature;
       state.lastEditAt = Date.now();
+      state.retries = 0;
     } catch (err) {
       this.handleEditError(jobId, state, err);
     } finally {
@@ -184,7 +192,18 @@ export class StatusMessenger implements QueueHooks {
       this.states.delete(jobId);
       return;
     }
-    // Network hiccup: leave state in place, the next update retries.
-    log(`edit failed for job ${jobId}: ${String(err)}`);
+    // Network hiccup: retry with a linear backoff — without this a terminal
+    // edit that fails once would be finalized away and the message stuck on
+    // an intermediate state forever.
+    state.retries += 1;
+    if (state.retries > MAX_TRANSIENT_RETRIES) {
+      log(`giving up on status message for job ${jobId} after ${state.retries - 1} retries: ${String(err)}`);
+      if (state.timer) clearTimeout(state.timer);
+      this.states.delete(jobId);
+      return;
+    }
+    state.backoffUntil = Date.now() + state.retries * this.intervalMs;
+    state.forced = true;
+    log(`edit failed for job ${jobId} (retry ${state.retries}): ${String(err)}`);
   }
 }
