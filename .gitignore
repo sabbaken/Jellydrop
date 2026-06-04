@@ -1,0 +1,50 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+/**/.last-run.json
+
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+tmp
+
+# Turborepo
+.turbo
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Claude Code (local-only)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/projects/
+.claude/todos/
+.claude/shell-snapshots/
+.claude/statsig/
+.claude/ide/
+
+# Env files
+.env
+.env.local
+.env.*.local
