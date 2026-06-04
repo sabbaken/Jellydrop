@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import type { Bot, Context } from "grammy";
 import type { Config } from "../config.js";
-import type { JobMode, JobStore } from "../db.js";
+import type { Job, JobMode, JobStore } from "../db.js";
 import type { DownloadQueue } from "../queue.js";
+import { truncate } from "../util/format.js";
 import { extractUrls } from "../util/links.js";
 import { jobKeyboard, renderHelp, renderJobMessage, renderQueueList } from "./render.js";
 
@@ -19,8 +21,18 @@ const CANCEL_REPLIES: Record<string, string> = {
 };
 
 /**
+ * A previous download of this URL whose file still exists in the library —
+ * no need to download again (deleted files fall through to a re-download).
+ */
+async function findInLibrary(store: JobStore, url: string, mode: JobMode): Promise<Job | undefined> {
+  const done = await store.listDoneByUrl(url, mode);
+  return done.find((job) => job.finalPath !== null && fs.existsSync(job.finalPath));
+}
+
+/**
  * One job + one status message per link (spec §10.2). All links from one
- * message share a batch_id; URLs already in the active queue are skipped.
+ * message share a batch_id; URLs already in the active queue are skipped,
+ * URLs already downloaded and still present in the library are not re-fetched.
  */
 async function enqueueLinks(
   ctx: Context,
@@ -32,16 +44,25 @@ async function enqueueLinks(
   if (chatId === undefined) return;
 
   const fresh: string[] = [];
-  let skipped = 0;
+  const inLibrary: Job[] = [];
+  let skippedActive = 0;
   for (const url of urls) {
-    if (await store.findActiveByUrl(url)) skipped += 1;
+    if (await store.findActiveByUrl(url, mode)) {
+      skippedActive += 1;
+      continue;
+    }
+    const existing = await findInLibrary(store, url, mode);
+    if (existing) inLibrary.push(existing);
     else fresh.push(url);
   }
 
   const notes: string[] = [];
   if (fresh.length > 1) notes.push(`Добавлено ${fresh.length} в очередь.`);
-  if (skipped > 0) notes.push(`Пропущено (уже в очереди): ${skipped}.`);
-  if (notes.length > 0) await ctx.reply(notes.join(" "));
+  if (skippedActive > 0) notes.push(`Пропущено (уже в очереди): ${skippedActive}.`);
+  for (const job of inLibrary) {
+    notes.push(`Уже в библиотеке: ${truncate(job.title ?? job.url, 80)}`);
+  }
+  if (notes.length > 0) await ctx.reply(notes.join("\n"));
   if (fresh.length === 0) return;
 
   const batchId = randomUUID();

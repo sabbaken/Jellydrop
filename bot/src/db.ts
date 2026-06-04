@@ -207,12 +207,21 @@ export class JobStore {
     return rows.map(toJob);
   }
 
-  async findActiveByUrl(url: string): Promise<Job | undefined> {
+  async findActiveByUrl(url: string, mode: JobMode): Promise<Job | undefined> {
     const row = await this.prisma.job.findFirst({
-      where: { url, status: { in: [...ACTIVE_STATUSES] } },
+      where: { url, mode, status: { in: [...ACTIVE_STATUSES] } },
       orderBy: { id: "asc" },
     });
     return row ? toJob(row) : undefined;
+  }
+
+  /** All completed jobs for a URL, newest first — used for library dedupe. */
+  async listDoneByUrl(url: string, mode: JobMode): Promise<Job[]> {
+    const rows = await this.prisma.job.findMany({
+      where: { url, mode, status: "done" },
+      orderBy: { id: "desc" },
+    });
+    return rows.map(toJob);
   }
 
   /**
