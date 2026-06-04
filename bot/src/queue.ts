@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Config } from "./config.js";
-import { ACTIVE_STATUSES, type Job, type JobStore } from "./db.js";
+import { ACTIVE_STATUSES, type Job, type JobPatch, type JobStore } from "./db.js";
 import {
   CanceledError,
   DownloadError,
@@ -37,7 +37,8 @@ function log(message: string): void {
  */
 export class DownloadQueue {
   private readonly running = new Set<number>();
-  private tickScheduled = false;
+  private draining = false;
+  private wakeRequested = false;
   private stopped = false;
 
   constructor(
@@ -48,25 +49,36 @@ export class DownloadQueue {
 
   /** Wake the pool: claim queued jobs until all slots are busy. */
   notify(): void {
-    if (this.tickScheduled || this.stopped) return;
-    this.tickScheduled = true;
+    if (this.stopped) return;
+    this.wakeRequested = true;
+    if (this.draining) return;
+    this.draining = true;
     setImmediate(() => {
-      this.tickScheduled = false;
-      this.tick();
+      void this.drain()
+        .catch((err) => log(`unexpected drain error: ${String(err)}`))
+        .finally(() => {
+          this.draining = false;
+          // Catch a notify() that raced with the tail of this drain.
+          if (this.wakeRequested && !this.stopped) this.notify();
+        });
     });
   }
 
-  private tick(): void {
-    while (!this.stopped && this.running.size < this.config.downloadConcurrency) {
-      const job = this.store.claimNextQueued();
-      if (!job) break;
-      this.running.add(job.id);
-      void this.run(job)
-        .catch((err) => log(`unexpected worker error for job ${job.id}: ${String(err)}`))
-        .finally(() => {
-          this.running.delete(job.id);
-          this.notify();
-        });
+  /** Single-flight claim loop — only one runs at a time (`draining` guard). */
+  private async drain(): Promise<void> {
+    while (this.wakeRequested && !this.stopped) {
+      this.wakeRequested = false;
+      while (!this.stopped && this.running.size < this.config.downloadConcurrency) {
+        const job = await this.store.claimNextQueued();
+        if (!job) break;
+        this.running.add(job.id);
+        void this.run(job)
+          .catch((err) => log(`unexpected worker error for job ${job.id}: ${String(err)}`))
+          .finally(() => {
+            this.running.delete(job.id);
+            this.notify();
+          });
+      }
     }
   }
 
@@ -81,57 +93,72 @@ export class DownloadQueue {
     return path.join(this.config.stagingDir, `job-${jobId}`);
   }
 
-  private update(jobId: number, options?: JobUpdateOptions): void {
-    const job = this.store.getJob(jobId);
+  private async update(jobId: number, options?: JobUpdateOptions): Promise<void> {
+    const job = await this.store.getJob(jobId);
     if (job) this.hooks.onJobUpdate(job, options);
   }
 
   private async run(job: Job): Promise<void> {
     const jobDir = this.jobDir(job.id);
     log(`job ${job.id}: started (${job.url})`);
-    this.update(job.id, { force: true });
+    await this.update(job.id, { force: true });
 
     try {
       // --- probe ------------------------------------------------------------
       const info = await probe(job.id, job.url, this.config);
       if (info.isPlaylist) throw new PlaylistError();
-      this.store.updateJob(job.id, { title: info.title, source: info.source });
-      this.ensureNotCanceled(job.id);
-      this.update(job.id, { force: true });
+      await this.store.updateJob(job.id, { title: info.title, source: info.source });
+      await this.ensureNotCanceled(job.id);
+      await this.update(job.id, { force: true });
 
       // --- download (+ in-yt-dlp post-processing) ---------------------------
       fs.mkdirSync(jobDir, { recursive: true });
+      let progressWriteBusy = false;
       await download(job.id, job.url, job.mode, jobDir, this.config, {
         onProgress: (p) => {
-          this.store.updateJob(job.id, {
-            ...(p.percent !== null ? { progress: p.percent } : {}),
-            speed: p.speed,
-            eta: p.eta,
-          });
-          this.update(job.id);
+          // Drop samples while a write is in flight — the next one catches up,
+          // and the messenger throttles edits anyway.
+          if (progressWriteBusy) return;
+          progressWriteBusy = true;
+          void (async () => {
+            await this.store.updateJob(job.id, {
+              ...(p.percent !== null ? { progress: p.percent } : {}),
+              speed: p.speed,
+              eta: p.eta,
+            });
+            await this.update(job.id);
+          })()
+            .catch((err) => log(`job ${job.id}: progress write failed: ${String(err)}`))
+            .finally(() => {
+              progressWriteBusy = false;
+            });
         },
         onPostProcessing: () => {
-          const updated = this.store.transition(job.id, ["downloading"], "processing", {
-            progress: 100,
-            speed: null,
-            eta: null,
-          });
-          if (updated) this.hooks.onJobUpdate(updated, { force: true });
+          void this.store
+            .transition(job.id, ["downloading"], "processing", {
+              progress: 100,
+              speed: null,
+              eta: null,
+            })
+            .then((updated) => {
+              if (updated) this.hooks.onJobUpdate(updated, { force: true });
+            })
+            .catch((err) => log(`job ${job.id}: processing transition failed: ${String(err)}`));
         },
       });
 
       // --- moving: atomic staging -> library (spec §8) -----------------------
-      this.transitionOrCancel(job.id, ["downloading", "processing"], "moving", {
+      await this.transitionOrCancel(job.id, ["downloading", "processing"], "moving", {
         speed: null,
         eta: null,
       });
-      this.update(job.id, { force: true });
+      await this.update(job.id, { force: true });
 
-      const finalPath = this.moveIntoLibrary(job, info.raw, jobDir);
+      const finalPath = await this.moveIntoLibrary(job, info.raw, jobDir);
 
       // --- scanning: Jellyfin library refresh (spec §9.3) --------------------
-      this.transitionOrCancel(job.id, ["moving"], "scanning");
-      this.update(job.id, { force: true });
+      await this.transitionOrCancel(job.id, ["moving"], "scanning");
+      await this.update(job.id, { force: true });
 
       const refreshed = await refreshLibrary(this.config);
       if (!refreshed) {
@@ -140,35 +167,35 @@ export class DownloadQueue {
 
       let deepLink: string | null = null;
       if (refreshed && this.config.enableJellyfinDeeplink) {
-        const title = this.store.getJob(job.id)?.title;
+        const title = (await this.store.getJob(job.id))?.title;
         if (title) deepLink = await findItemDeepLink(this.config, title);
       }
 
-      this.store.transition(job.id, ["scanning"], "done", {
+      await this.store.transition(job.id, ["scanning"], "done", {
         progress: 100,
         speed: null,
         eta: null,
-        finished_at: new Date().toISOString(),
+        finishedAt: new Date(),
       });
-      this.update(job.id, { force: true, deepLink });
+      await this.update(job.id, { force: true, deepLink });
       log(`job ${job.id}: done -> ${finalPath}`);
     } catch (err) {
-      this.handleRunError(job.id, jobDir, err);
+      await this.handleRunError(job.id, jobDir, err);
     }
   }
 
   /** Throw CanceledError when the job was canceled from under the worker. */
-  private ensureNotCanceled(jobId: number): void {
-    if (this.store.getJob(jobId)?.status === "canceled") throw new CanceledError();
+  private async ensureNotCanceled(jobId: number): Promise<void> {
+    if ((await this.store.getJob(jobId))?.status === "canceled") throw new CanceledError();
   }
 
-  private transitionOrCancel(
+  private async transitionOrCancel(
     jobId: number,
     from: readonly Job["status"][],
     to: Job["status"],
-    patch: Parameters<JobStore["transition"]>[3] = {},
-  ): Job {
-    const updated = this.store.transition(jobId, from, to, patch);
+    patch: JobPatch = {},
+  ): Promise<Job> {
+    const updated = await this.store.transition(jobId, from, to, patch);
     if (!updated) throw new CanceledError();
     return updated;
   }
@@ -178,7 +205,11 @@ export class DownloadQueue {
    * sidecars from the per-job staging dir into the library (spec §8). Only
    * fully finished files are moved — Jellyfin never sees partials.
    */
-  private moveIntoLibrary(job: Job, probeJson: Record<string, unknown>, jobDir: string): string {
+  private async moveIntoLibrary(
+    job: Job,
+    probeJson: Record<string, unknown>,
+    jobDir: string,
+  ): Promise<string> {
     const { media, sidecars } = findOutputFiles(jobDir);
     if (!media) {
       throw new DownloadError(
@@ -210,24 +241,24 @@ export class DownloadQueue {
       if (src === media) finalMediaPath = dest;
     }
 
-    this.store.updateJob(job.id, { staging_path: media, final_path: finalMediaPath });
+    await this.store.updateJob(job.id, { stagingPath: media, finalPath: finalMediaPath });
     fs.rmSync(jobDir, { recursive: true, force: true });
     return finalMediaPath;
   }
 
-  private handleRunError(jobId: number, jobDir: string, err: unknown): void {
-    const current = this.store.getJob(jobId);
+  private async handleRunError(jobId: number, jobDir: string, err: unknown): Promise<void> {
+    const current = await this.store.getJob(jobId);
 
     // User-initiated cancel: cancel() already flipped the status and killed the
     // process; here we delete partial files and finalize the message (spec §7.4).
     if (current?.status === "canceled") {
       fs.rmSync(jobDir, { recursive: true, force: true });
-      this.store.updateJob(jobId, {
+      await this.store.updateJob(jobId, {
         speed: null,
         eta: null,
-        finished_at: current.finished_at ?? new Date().toISOString(),
+        finishedAt: current.finishedAt ?? new Date(),
       });
-      this.update(jobId, { force: true });
+      await this.update(jobId, { force: true });
       log(`job ${jobId}: canceled, partial files removed`);
       return;
     }
@@ -246,11 +277,11 @@ export class DownloadQueue {
           ? err.message
           : `internal error: ${err instanceof Error ? err.message : String(err)}`;
 
-    const updated = this.store.transition(jobId, ACTIVE_STATUSES, "failed", {
+    const updated = await this.store.transition(jobId, ACTIVE_STATUSES, "failed", {
       error: message.slice(0, 1000),
       speed: null,
       eta: null,
-      finished_at: new Date().toISOString(),
+      finishedAt: new Date(),
     });
     fs.rmSync(jobDir, { recursive: true, force: true });
     if (updated) this.hooks.onJobUpdate(updated, { force: true });
@@ -261,13 +292,13 @@ export class DownloadQueue {
    * Cancel a job (spec §7.4): queued jobs are removed from the queue; running
    * jobs get their yt-dlp process killed, the worker then deletes partials.
    */
-  cancel(jobId: number): CancelResult {
-    const job = this.store.getJob(jobId);
+  async cancel(jobId: number): Promise<CancelResult> {
+    const job = await this.store.getJob(jobId);
     if (!job) return "not_found";
 
     if (job.status === "queued") {
-      const updated = this.store.transition(jobId, ["queued"], "canceled", {
-        finished_at: new Date().toISOString(),
+      const updated = await this.store.transition(jobId, ["queued"], "canceled", {
+        finishedAt: new Date(),
       });
       if (updated) {
         this.hooks.onJobUpdate(updated, { force: true });
@@ -277,10 +308,10 @@ export class DownloadQueue {
       // Lost the race with a worker claim — fall through to the running branch.
     }
 
-    const updated = this.store.transition(jobId, ["downloading", "processing"], "canceled", {
+    const updated = await this.store.transition(jobId, ["downloading", "processing"], "canceled", {
       speed: null,
       eta: null,
-      finished_at: new Date().toISOString(),
+      finishedAt: new Date(),
     });
     if (updated) {
       const killed = killJobProcess(jobId);
